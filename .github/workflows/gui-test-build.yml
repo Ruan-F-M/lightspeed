@@ -1,0 +1,43 @@
+# Builds the Windows GUI from this branch and uploads it as a zip, so a fix can
+# be tried on a real machine before it is released. Not part of a release.
+name: GUI test build (Windows zip)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/tray-hidden-window
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build lightspeed-gui.exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.100.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build GUI (release)
+        run: cargo build --release --locked -p lightspeed-gui
+
+      # WinDivert resolves its driver from the directory of the exe, so the
+      # DLL and the signed driver ship beside it.
+      - name: Collect files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item target/release/lightspeed-gui.exe out/
+          Copy-Item client/windivert/WinDivert.dll out/
+          Copy-Item client/windivert/WinDivert64.sys out/
+          Copy-Item client/windivert/LICENSE.windivert out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lightspeed-gui-windows-x64
+          path: out/
+          retention-days: 14

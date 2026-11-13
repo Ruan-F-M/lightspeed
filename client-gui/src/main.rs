@@ -91,7 +91,7 @@ fn run() -> anyhow::Result<()> {
         .with_inner_size([440.0, 800.0])
         .with_min_inner_size([320.0, 400.0])
         .with_resizable(true)
-        .with_title("LightSpeed");
+        .with_title(platform::WINDOW_TITLE);
     // A failed icon decode must not abort startup.
     let viewport = match window_icon() {
         Some(icon) => viewport.with_icon(icon),

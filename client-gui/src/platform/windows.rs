@@ -2,9 +2,20 @@
 //!
 //! Real tray-icon backend using `tray_icon`, admin check via `net session`,
 //! and capture check via `sc query npcap`.
+//!
+//! ## Why the tray does not run in the frame loop
+//!
+//! Windows sends no `WM_PAINT` to a hidden or minimized window, so eframe
+//! stops calling `App::ui` the moment the window is hidden to the tray. Tray
+//! events polled from the frame loop were therefore never read while hidden:
+//! "Show window" and a double-click did nothing, and Quit left the process
+//! running. The tray events are now read on their own threads, which show the
+//! window through Win32 directly; the frame loop only receives the actions
+//! that need the app (Connect / Disconnect) once it is painting again.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::app::TrayState;
 use crate::platform::{Platform, QuitFlag, TrayAction, TrayHandle};
@@ -39,12 +50,18 @@ unsafe impl Send for WindowsTray {}
 /// communicates back to the app via [`TrayHandle::poll_events`].
 pub struct WindowsTray {
     icon: TrayIcon,
-    id_show: MenuId,
-    id_connect: MenuId,
-    id_disconnect: MenuId,
-    id_quit: MenuId,
-    quit: QuitFlag,
+    /// Connect / Disconnect picked in the tray menu, forwarded by the menu
+    /// thread. Drained by the frame loop.
+    actions: Receiver<TrayAction>,
     last_state: Cell<TrayState>,
+}
+
+/// The tray menu item ids, moved into the menu thread.
+struct MenuIds {
+    show: MenuId,
+    connect: MenuId,
+    disconnect: MenuId,
+    quit: MenuId,
 }
 
 impl WindowsTray {
@@ -86,45 +103,85 @@ impl WindowsTray {
             }
         };
 
+        let (tx, actions) = channel();
+        spawn_menu_thread(
+            MenuIds {
+                show: id_show,
+                connect: id_connect,
+                disconnect: id_disconnect,
+                quit: id_quit,
+            },
+            quit,
+            tx,
+        );
+        spawn_icon_thread();
+
         Some(WindowsTray {
             icon,
-            id_show,
-            id_connect,
-            id_disconnect,
-            id_quit,
-            quit,
+            actions,
             last_state: Cell::new(TrayState::Disconnected),
         })
     }
 }
 
+/// Read tray menu events off the frame loop.
+///
+/// Every item brings the window back except Quit: Connect and Disconnect need
+/// the app, and the app only runs while the window is painting.
+fn spawn_menu_thread(ids: MenuIds, quit: QuitFlag, actions: Sender<TrayAction>) {
+    let spawned = std::thread::Builder::new()
+        .name("ls-tray-menu".into())
+        .spawn(move || {
+            while let Ok(event) = MenuEvent::receiver().recv() {
+                tracing::debug!("Tray menu event: {:?}", event.id);
+                if event.id == ids.show {
+                    native::show_main_window();
+                } else if event.id == ids.connect {
+                    let _ = actions.send(TrayAction::Connect);
+                    native::show_main_window();
+                } else if event.id == ids.disconnect {
+                    let _ = actions.send(TrayAction::Disconnect);
+                    native::show_main_window();
+                } else if event.id == ids.quit {
+                    // Tray Quit must terminate the process, not hide the
+                    // window. A painting frame loop sees the flag at once; the
+                    // quit watchdog in app.rs covers a hidden window.
+                    tracing::info!("Tray Quit picked");
+                    quit.store(true, Ordering::Relaxed);
+                    native::repaint_main_window();
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the tray menu thread: {e}");
+    }
+}
+
+/// Read tray icon events off the frame loop: a double-click shows the window.
+///
+/// The thread also keeps the event queue drained. The icon reports every
+/// mouse move over it, and nothing read that queue while the window was
+/// hidden.
+fn spawn_icon_thread() {
+    let spawned = std::thread::Builder::new()
+        .name("ls-tray-icon".into())
+        .spawn(move || {
+            while let Ok(event) = TrayIconEvent::receiver().recv() {
+                if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+                    native::show_main_window();
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the tray icon thread: {e}");
+    }
+}
+
 impl TrayHandle for WindowsTray {
-    fn poll_events(&self, ctx: &egui::Context) -> Vec<TrayAction> {
-        let mut actions = Vec::new();
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            tracing::debug!("Tray menu event: {:?}", event.id);
-            if event.id == self.id_show {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if event.id == self.id_connect {
-                actions.push(TrayAction::Connect);
-            } else if event.id == self.id_disconnect {
-                actions.push(TrayAction::Disconnect);
-            } else if event.id == self.id_quit {
-                // Tray Quit must terminate the process, not hide the window.
-                // The frame loop sees the flag, tears the engine down, and
-                // exits; the repaint wakes it immediately.
-                self.quit.store(true, Ordering::Relaxed);
-                ctx.request_repaint();
-            }
-        }
-        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(event, TrayIconEvent::DoubleClick { .. }) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            }
-        }
-        actions
+    fn poll_events(&self, _ctx: &egui::Context) -> Vec<TrayAction> {
+        // Show and Quit are handled on the tray threads; only the actions
+        // that need the engine arrive here.
+        self.actions.try_iter().collect()
     }
 
     fn set_state(&self, state: TrayState, rtt_ms: f64) {
@@ -270,6 +327,114 @@ impl Platform for WindowsPlatform {
             .args(["-WindowStyle", "Hidden", "-Command", &script])
             .spawn();
         std::process::exit(0);
+    }
+}
+
+// ── Main window control ──────────────────────────────────────────────────────
+
+/// Show, restore and repaint the main window from any thread.
+///
+/// `egui::ViewportCommand`s cannot do this: they are applied at the end of a
+/// frame, and a hidden window gets no frames.
+mod native {
+    use std::ffi::c_void;
+
+    type Hwnd = *mut c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowExW(
+            parent: Hwnd,
+            child_after: Hwnd,
+            class: *const u16,
+            title: *const u16,
+        ) -> Hwnd;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, process_id: *mut u32) -> u32;
+        fn GetClassNameW(hwnd: Hwnd, buffer: *mut u16, capacity: i32) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
+        fn ShowWindowAsync(hwnd: Hwnd, command: i32) -> i32;
+        fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+        fn InvalidateRect(hwnd: Hwnd, rect: *const c_void, erase: i32) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcessId() -> u32;
+    }
+
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+    /// Window class of every Win32 dialog, including `MessageBoxW`.
+    const DIALOG_CLASS: &str = "#32770";
+
+    /// This process's main window, visible or not.
+    ///
+    /// Matched by title among the top-level windows this process owns. The
+    /// crash dialog carries the same title, so dialogs are skipped.
+    fn find_main_window() -> Option<Hwnd> {
+        let title: Vec<u16> = crate::platform::WINDOW_TITLE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: plain kernel32 call with no arguments.
+        let own_process = unsafe { GetCurrentProcessId() };
+        let mut hwnd: Hwnd = std::ptr::null_mut();
+        loop {
+            // SAFETY: `title` is NUL-terminated and outlives the call; a null
+            // parent and class enumerate top-level windows of any class, and
+            // `hwnd` is null or a handle this function returned.
+            hwnd = unsafe {
+                FindWindowExW(std::ptr::null_mut(), hwnd, std::ptr::null(), title.as_ptr())
+            };
+            if hwnd.is_null() {
+                return None;
+            }
+            let mut process: u32 = 0;
+            // SAFETY: `hwnd` was just returned by `FindWindowExW` and
+            // `process` is a valid out pointer.
+            unsafe { GetWindowThreadProcessId(hwnd, &mut process) };
+            if process == own_process && !is_dialog(hwnd) {
+                return Some(hwnd);
+            }
+        }
+    }
+
+    fn is_dialog(hwnd: Hwnd) -> bool {
+        let mut buffer = [0u16; 64];
+        // SAFETY: the buffer is 64 UTF-16 units long and that capacity is
+        // what is passed.
+        let len = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+        let len = usize::try_from(len).unwrap_or(0).min(buffer.len());
+        String::from_utf16_lossy(&buffer[..len]) == DIALOG_CLASS
+    }
+
+    /// Un-hide (or un-minimize) the main window and bring it to the front.
+    pub fn show_main_window() {
+        let Some(hwnd) = find_main_window() else {
+            tracing::warn!("tray: main window not found, cannot show it");
+            return;
+        };
+        // SAFETY: `hwnd` is a live top-level window of this process. The
+        // async variant posts to the UI thread, so a busy frame loop cannot
+        // block the tray thread.
+        unsafe {
+            let command = if IsIconic(hwnd) != 0 {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
+            ShowWindowAsync(hwnd, command);
+            SetForegroundWindow(hwnd);
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
+    }
+
+    /// Ask a visible main window for a frame without changing its state.
+    pub fn repaint_main_window() {
+        if let Some(hwnd) = find_main_window() {
+            // SAFETY: `hwnd` is a live top-level window of this process.
+            unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+        }
     }
 }
 

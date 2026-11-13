@@ -80,7 +80,16 @@ pub fn show_already_running_notice() {
                    LightSpeed window.";
     tracing::info!("Second instance detected, showing notice and exiting");
     #[cfg(windows)]
-    message_box(message);
+    {
+        // The running instance is usually hidden in the tray. Bringing its
+        // window back is what the user launched the app for; the notice is
+        // only the fallback when the window cannot be found.
+        if raise_running_window() {
+            tracing::info!("raised the running instance's window");
+            return;
+        }
+        message_box(message);
+    }
     #[cfg(not(windows))]
     {
         eprintln!("{message}");
@@ -148,6 +157,54 @@ mod win {
 
     /// `CreateMutexW` sets this when the named mutex already exists.
     pub const ERROR_ALREADY_EXISTS: u32 = 183;
+}
+
+/// Show and focus the window of the instance that holds the guard.
+///
+/// Returns `false` when no such window exists, so the caller can fall back to
+/// the notice. The window is matched by winit's window class as well as the
+/// title: an Explorer window open on a folder called "LightSpeed" has the
+/// same title.
+#[cfg(windows)]
+fn raise_running_window() -> bool {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> *mut c_void;
+        fn IsIconic(hwnd: *mut c_void) -> i32;
+        fn ShowWindowAsync(hwnd: *mut c_void, command: i32) -> i32;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+        fn InvalidateRect(hwnd: *mut c_void, rect: *const c_void, erase: i32) -> i32;
+    }
+
+    const SW_SHOW: i32 = 5;
+    const SW_RESTORE: i32 = 9;
+    /// The class winit registers for every window it creates.
+    const WINIT_WINDOW_CLASS: &str = "Window Class";
+
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let class = wide(WINIT_WINDOW_CLASS);
+    let title = wide(crate::platform::WINDOW_TITLE);
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+    if hwnd.is_null() {
+        return false;
+    }
+    // SAFETY: `hwnd` was just returned by `FindWindowW`. The async variant
+    // posts to the owning process, so a busy first instance cannot hang this
+    // one.
+    unsafe {
+        let command = if IsIconic(hwnd) != 0 {
+            SW_RESTORE
+        } else {
+            SW_SHOW
+        };
+        ShowWindowAsync(hwnd, command);
+        SetForegroundWindow(hwnd);
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+    true
 }
 
 #[cfg(windows)]

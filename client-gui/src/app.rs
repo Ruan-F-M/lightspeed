@@ -212,6 +212,38 @@ fn relay_reply_fault_message(
     }
 }
 
+/// How long the frame loop gets to act on a Quit before the watchdog does.
+const QUIT_GRACE: Duration = Duration::from_millis(1500);
+
+/// Stop every data-plane backend and the control plane.
+fn stop_engine(engine: &Mutex<LightSpeedEngine>) {
+    let mut engine = lock_or_recover(engine);
+    engine.stop_interceptor();
+    engine.stop_windivert();
+    engine.stop_capture();
+    engine.stop_redirect();
+    engine.disconnect();
+}
+
+/// Make Quit work when the frame loop is not running.
+///
+/// The frame loop acts on the quit flag, but a window hidden to the tray gets
+/// no frames on Windows, and a frame loop stuck in a slow engine call cannot
+/// act either. Without this thread a tray Quit in those states left the
+/// process, and the capture it holds, running with no window to close. The
+/// grace period lets a painting frame loop win, so the usual path is unchanged.
+fn spawn_quit_watchdog(engine: Arc<Mutex<LightSpeedEngine>>, quit: QuitFlag) {
+    std::thread::spawn(move || {
+        while !quit.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(QUIT_GRACE);
+        tracing::info!("Quit requested with no frame to act on it - stopping engine");
+        stop_engine(&engine);
+        std::process::exit(0);
+    });
+}
+
 /// Spawn the no-reply fallback on a background thread.
 ///
 /// It must not run in the UI loop: a relay or interceptor restart can block
@@ -1188,6 +1220,7 @@ impl<P: Platform> LightSpeedApp<P> {
         i18n::set_language(language.as_deref());
 
         spawn_relay_reply_watchdog(Arc::clone(&engine), Arc::clone(&quit));
+        spawn_quit_watchdog(Arc::clone(&engine), Arc::clone(&quit));
         let mut app = Self {
             engine,
             status,
@@ -1965,12 +1998,7 @@ impl<P: Platform> LightSpeedApp<P> {
     }
 
     fn shutdown_engine(&mut self) {
-        let mut engine = lock_or_recover(&self.engine);
-        engine.stop_interceptor();
-        engine.stop_windivert();
-        engine.stop_capture();
-        engine.stop_redirect();
-        engine.disconnect();
+        stop_engine(&self.engine);
     }
 
     fn start_update_check(&mut self) {

@@ -11,6 +11,12 @@ use eframe::egui;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+/// Title of the main window.
+///
+/// The Windows tray and the single-instance guard find the window by this
+/// title, so it has to be the same string the viewport is created with.
+pub const WINDOW_TITLE: &str = "LightSpeed";
+
 /// Shared flag the tray sets when the user picks "Quit"; the frame loop turns
 /// it into a clean process exit.
 pub type QuitFlag = Arc<AtomicBool>;
