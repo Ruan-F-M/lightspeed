@@ -1,5 +1,7 @@
-# Builds the Windows GUI from this branch and uploads it as a zip, so a fix can
-# be tried on a real machine before it is released. Not part of a release.
+# Builds the Windows GUI from this branch and publishes it as a zip on a test
+# pre-release, so a fix can be tried on a real machine before it is released.
+# The tag has no version number on purpose: a version-shaped tag would start
+# the real release workflow.
 name: GUI test build (Windows zip)
 
 on:
@@ -9,7 +11,7 @@ on:
       - fix/tray-hidden-window
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -41,3 +43,16 @@ jobs:
           name: lightspeed-gui-windows-x64
           path: out/
           retention-days: 14
+
+      - name: Publish test pre-release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Compress-Archive -Path out/* -DestinationPath lightspeed-gui-windows-x64.zip -Force
+          gh release delete trayfix-test --yes --cleanup-tag 2>$null
+          gh release create trayfix-test lightspeed-gui-windows-x64.zip `
+            --prerelease `
+            --target $env:GITHUB_SHA `
+            --title "Test build: tray fix (unreleased)" `
+            --notes "Untested build of the fix/tray-hidden-window branch. Extract everything into one folder and run lightspeed-gui.exe."
